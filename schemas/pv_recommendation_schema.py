@@ -140,7 +140,7 @@ PV_RECOMMENDATION_SCHEMA: Dict[str, Any] = {
                 "properties": {
                     "source": {
                         "type": "string",
-                        "enum": ["features", "tool_results", "catalog"],
+                        "enum": ["features", "tool_results", "catalog", "user_inputs"],
                     },
                     "quote_or_value": {"type": "string"},
                 },
@@ -345,10 +345,10 @@ def validate_recommendation(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
                 continue
             if "source" not in entry:
                 errors.append(f"evidence[{i}] missing 'source'")
-            elif entry["source"] not in ("features", "tool_results", "catalog"):
+            elif entry["source"] not in ("features", "tool_results", "catalog", "user_inputs"):
                 errors.append(
                     f"evidence[{i}].source must be one of 'features', "
-                    f"'tool_results', 'catalog' — got '{entry['source']}'"
+                    f"'tool_results', 'catalog', 'user_inputs' — got '{entry['source']}'"
                 )
             if "quote_or_value" not in entry:
                 errors.append(f"evidence[{i}] missing 'quote_or_value'")

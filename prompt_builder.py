@@ -111,12 +111,16 @@ SCENARIO STRUCTURE:
      - "optimal"     : technically best system (max offset / ROI); may
                        exceed the stated budget but must NOT exceed roof capacity.
      - "recommended" : budget-aware, practical system the homeowner
-                       should actually purchase; must NOT exceed
-                       max_panels_by_budget from TOOL RESULTS when the
-                       budget is binding.
+                       should actually purchase.  Its `capex_estimate_usd`
+                       (gross) MUST be <= USER INPUTS > budget_usd.  Pick
+                       between the two recommended candidates (RECOMMENDED
+                       and RECOMMENDED_PV_ONLY_ALT) per DECISION POLICY,
+                       prioritising more panels over battery inclusion
+                       whenever budget is tight.
   2. Each scenario's `panels` and derived values MUST match one of the
-     pre-computed scenarios in TOOL RESULTS.  Do not pick a different
-     panel count and then re-derive the economics yourself.
+     pre-computed scenarios in TOOL RESULTS (OPTIMAL, RECOMMENDED, or
+     RECOMMENDED_PV_ONLY_ALT).  Do not pick a different panel count and
+     then re-derive the economics yourself.
   3. Each scenario must include a `rationale` field (1-3 sentences
      explaining the panel-count choice — reference specific numbers
      from TOOL RESULTS or FEATURES).
@@ -141,9 +145,10 @@ CONSTRAINTS:
 SELF-CHECK (run before outputting):
   9. For each scenario, verify:
      panels * panel_watt_peak / 1000 == kw_dc  (within 0.01)
-     capex_estimate_usd matches TOOL RESULTS gross_capex_usd
-     payback_years_estimate matches TOOL RESULTS simple_payback_years
-     expected_annual_savings_usd matches TOOL RESULTS annual_savings_usd
+     capex_estimate_usd matches the chosen TOOL RESULTS candidate's gross_capex_usd
+     payback_years_estimate matches that candidate's simple_payback_years
+     expected_annual_savings_usd matches that candidate's annual_savings_usd
+     For the "recommended" scenario: capex_estimate_usd <= USER INPUTS budget_usd.
      If any check fails, correct your output to match TOOL RESULTS.
   10. For battery_recommendation, verify:
      extra_annual_savings_usd matches BATTERY ANALYSIS > extra_annual_savings_usd
@@ -177,10 +182,41 @@ Copy values from TOOL RESULTS > OPTIMAL SCENARIO.
   Set constraints.budget_binding = False.
 
 --- RECOMMENDED scenario ---
-Copy values from TOOL RESULTS > RECOMMENDED SCENARIO.
-  Panel count = N_rec (already computed: min(N_70, N_budget, N_roof)).
-  All financial values come from TOOL RESULTS.  Do NOT recompute them.
-  Set constraints.budget_binding = True if N_budget < N_70, else False.
+You must PICK between two pre-computed candidates and then COPY that
+candidate's numbers verbatim.  Never invent a third panel count.
+
+  Candidate A = TOOL RESULTS > RECOMMENDED SCENARIO (default pick; may
+                include battery when it fits alongside panels).
+  Candidate B = TOOL RESULTS > RECOMMENDED_PV_ONLY_ALT SCENARIO
+                (PV-only sizing against the full budget; `null` when
+                Candidate A is already PV-only).
+
+Decision priority — apply in order and pick the first candidate that
+wins:
+
+  1. BUDGET FEASIBILITY (hard gate): the picked candidate's
+     `gross_capex_usd` MUST be <= USER INPUTS > budget_usd.  If a
+     candidate violates the budget, discard it immediately.
+  2. PANEL PRIORITY: among the remaining candidates, prefer the one
+     with the higher `n_panels`.  Panels drive long-run savings, so
+     more panels wins ties when both fit the budget.
+  3. BATTERY UPSIDE (tie-break when panel counts are within ±1):
+     prefer Candidate A if BATTERY ANALYSIS >
+     battery_incremental_payback_years is not null AND <= 12 AND
+     extra_annual_savings_usd >= 250.  Otherwise prefer Candidate B.
+
+Then COPY the winning candidate's fields (panels, kw_dc,
+gross_capex_usd, net_capex_after_itc_usd, annual_savings_usd, payback,
+NPV, import/export) into the "recommended" scenario.  Do NOT mix
+numbers across candidates.
+
+Set constraints.budget_binding = True when the winning candidate's
+n_panels < N_70 because of the budget (i.e. budget is the binding
+limit), else False.
+
+In `rationale`, state: (a) which candidate you picked, (b) why the
+other candidate lost (budget violation, fewer panels, or weak battery
+payback), and (c) whether budget is binding.
 
 For both scenarios:
   - annual_consumption_kwh_used = TOOL RESULTS > load_profile_summary > annual_kwh.
@@ -344,20 +380,26 @@ def _format_tool_results_block(tool_results: Dict[str, Any]) -> str:
     # Sizing
     sz = tool_results.get("sizing", {})
     lines.append("=== SYSTEM SIZING ===")
-    lines.append(f"  Panels for 100% offset  : {sz.get('panels_for_100pct', '?')}")
-    lines.append(f"  Panels for 70% offset   : {sz.get('panels_for_70pct', '?')}")
-    lines.append(f"  Max by roof dimensions  : {sz.get('max_panels_by_roof', '?')}")
-    lines.append(f"  Max by budget           : {sz.get('max_panels_by_budget', '?')}")
-    lines.append(f"  Prod per panel/yr       : {sz.get('annual_prod_per_panel_kwh', 0):.1f} kWh")
+    lines.append(f"  Panels for 100% offset           : {sz.get('panels_for_100pct', '?')}")
+    lines.append(f"  Panels for 70% offset            : {sz.get('panels_for_70pct', '?')}")
+    lines.append(f"  Max by roof dimensions           : {sz.get('max_panels_by_roof', '?')}")
+    lines.append(f"  Max by budget (current default)  : {sz.get('max_panels_by_budget', '?')}")
+    lines.append(f"  Max by budget (PV-only)          : {sz.get('max_panels_by_budget_pv_only', '?')}")
+    lines.append(f"  Max by budget (PV + battery)     : {sz.get('max_panels_by_budget_with_battery', '?')}")
+    lines.append(f"  Candidate n_rec (PV-only)        : {sz.get('n_rec_pv_only', '?')}")
+    lines.append(f"  Candidate n_rec (PV + battery)   : {sz.get('n_rec_with_battery', '?')}")
+    lines.append(f"  Prod per panel/yr                : {sz.get('annual_prod_per_panel_kwh', 0):.1f} kWh")
     lines.append("")
 
     for label, key in [("RECOMMENDED", "recommended_scenario"),
+                       ("RECOMMENDED_PV_ONLY_ALT", "recommended_pv_only_scenario"),
                        ("OPTIMAL", "optimal_scenario")]:
         sc = tool_results.get(key, {})
         if not sc:
             continue
         n = sc.get('n_panels', '?')
-        lines.append(f"=== {label} SCENARIO (pre-computed economics) ===")
+        mode = sc.get('sizing_mode', '?')
+        lines.append(f"=== {label} SCENARIO (pre-computed economics, mode={mode}) ===")
         lines.append(f"  Panels             : {n}")
         lines.append(f"  System size        : {sc.get('system_kw_dc', '?')} kW DC")
         tc  = sc.get("total_cells_on_roof", "?")
@@ -412,7 +454,7 @@ def _format_tool_results_block(tool_results: Dict[str, Any]) -> str:
         ip = ba.get('battery_incremental_payback_years')
         lines.append(f"  Battery incremental payback       : "
                      f"{f'{ip:.1f} years' if ip is not None else 'N/A (no net savings)'}")
-        lines.append(f"  TOOL DECISION                     : {ba.get('decision', '?').upper()}")
+        lines.append(f"  TOOL DECISION                     : {ba.get('decision', '?')}")
         lines.append("")
 
     return "\n".join(lines)

@@ -645,10 +645,20 @@ def _compare_all_brands(
         # Budget capacity: use gross cost (incl. 10% install) so CAPEX <= budget pre-ITC
         p_kw             = p["panel_power_w"] / 1000.0
         cost_per_panel   = p["panel_power_w"] * p["cost_per_wp_usd"]
-        bat_gross        = (battery["cost_usd"] * battery_units * (1 + INSTALLATION_COST_RATE)) if battery else 0.0
+        row_battery      = battery
+        row_bat_units    = battery_units
+        bat_gross        = (row_battery["cost_usd"] * row_bat_units * (1 + INSTALLATION_COST_RATE)) if row_battery else 0.0
         cost_per_panel_gross = cost_per_panel * (1 + INSTALLATION_COST_RATE)
         budget_for_pv    = max(0.0, budget_usd - bat_gross)
         max_budget       = int(budget_for_pv // cost_per_panel_gross) if cost_per_panel_gross > 0 else 0
+
+        # Feasibility fallback: drop battery if it leaves zero room for PV.
+        if max_budget < 1 and row_battery is not None:
+            row_battery   = None
+            row_bat_units = 0
+            bat_gross     = 0.0
+            budget_for_pv = float(budget_usd)
+            max_budget    = int(budget_for_pv // cost_per_panel_gross) if cost_per_panel_gross > 0 else 0
 
         # Sizing: aim for 70 % offset as the budget-aware target
         ann_prod_pp      = p_kw * irradiance * PR_PERFORMANCE_RATIO
@@ -673,11 +683,11 @@ def _compare_all_brands(
             continue
 
         pv_h  = build_hourly_pv_output(p, n_panels, irradiance)
-        disp  = run_dispatch_simulation(hourly_load, pv_h, tariffs, battery)
+        disp  = run_dispatch_simulation(hourly_load, pv_h, tariffs, row_battery)
         econ  = compute_economics(
-            disp, p, n_panels, battery, battery_units,
+            disp, p, n_panels, row_battery, row_bat_units,
             annual_kwh, avg_tariff,
-            with_battery=battery is not None,
+            with_battery=row_battery is not None,
         )
 
         rows.append({
@@ -861,14 +871,40 @@ def run_all_tools(
     panels_100 = math.ceil(annual_kwh / annual_prod_per_panel) if annual_prod_per_panel > 0 else 0
     panels_70  = math.ceil(annual_kwh * 0.70 / annual_prod_per_panel) if annual_prod_per_panel > 0 else 0
 
-    # Budget uses gross cost (incl. 10% install) so CAPEX <= budget pre-ITC
+    # Budget uses gross cost (incl. 10% install) so CAPEX <= budget pre-ITC.
+    # The tool surfaces TWO candidate recommended sizings — PV-only and
+    # PV+battery — so the agent can reason about the tradeoff. Panel count
+    # is prioritised: PV-only sizes against the full budget; PV+battery
+    # reserves battery capex first and then fits panels into what remains.
     cost_per_panel       = panel["panel_power_w"] * panel["cost_per_wp_usd"]
-    bat_gross            = (battery["cost_usd"] * battery_units * (1 + INSTALLATION_COST_RATE)) if battery else 0.0
     cost_per_panel_gross = cost_per_panel * (1 + INSTALLATION_COST_RATE)
+    full_bat_gross       = (battery["cost_usd"] * battery_units * (1 + INSTALLATION_COST_RATE)) if battery else 0.0
+
+    # PV-only candidate
+    max_panels_by_budget_pv_only = int(budget_usd // cost_per_panel_gross) if cost_per_panel_gross > 0 else 0
+    n_rec_pv_only = min(panels_70, max_panels_by_budget_pv_only, max_panels_by_roof)
+
+    # PV+battery candidate
+    budget_for_pv_with_bat        = max(0.0, budget_usd - full_bat_gross)
+    max_panels_by_budget_with_bat = int(budget_for_pv_with_bat // cost_per_panel_gross) if cost_per_panel_gross > 0 else 0
+    n_rec_with_bat = min(panels_70, max_panels_by_budget_with_bat, max_panels_by_roof) if battery is not None else 0
+
+    # Default n_rec (used by downstream recommended_scenario): pick PV+battery
+    # when the battery has room to also deliver at least one panel; otherwise
+    # fall back to PV-only so we never report a zero-panel system.
+    if battery is not None and n_rec_with_bat >= 1:
+        n_rec               = n_rec_with_bat
+        rec_battery         = battery
+        rec_battery_units   = battery_units
+        bat_gross           = full_bat_gross
+    else:
+        n_rec               = n_rec_pv_only
+        rec_battery         = None
+        rec_battery_units   = 0
+        bat_gross           = 0.0
+
     budget_for_pv        = max(0.0, budget_usd - bat_gross)
     max_panels_by_budget = int(budget_for_pv // cost_per_panel_gross) if cost_per_panel_gross > 0 else 0
-
-    n_rec = min(panels_70, max_panels_by_budget, max_panels_by_roof)
     n_opt = min(panels_100, max_panels_by_roof)
 
     results: Dict[str, Any] = {
@@ -911,11 +947,15 @@ def run_all_tools(
             **roof_layout,
         },
         "sizing": {
-            "panels_for_100pct":         panels_100,
-            "panels_for_70pct":          panels_70,
-            "max_panels_by_roof":        max_panels_by_roof,
-            "max_panels_by_budget":      max_panels_by_budget,
-            "annual_prod_per_panel_kwh": round(annual_prod_per_panel, 1),
+            "panels_for_100pct":                 panels_100,
+            "panels_for_70pct":                  panels_70,
+            "max_panels_by_roof":                max_panels_by_roof,
+            "max_panels_by_budget":              max_panels_by_budget,
+            "max_panels_by_budget_pv_only":      max_panels_by_budget_pv_only,
+            "max_panels_by_budget_with_battery": max_panels_by_budget_with_bat,
+            "n_rec_pv_only":                     n_rec_pv_only,
+            "n_rec_with_battery":                n_rec_with_bat,
+            "annual_prod_per_panel_kwh":         round(annual_prod_per_panel, 1),
         },
         "brand_selection": {
             "mode":                 "auto" if auto_brand else "user_specified",
@@ -925,15 +965,32 @@ def run_all_tools(
         },
     }
 
-    # 4F + 4H + 4I for recommended scenario
+    # 4F + 4H + 4I for recommended scenario (default pick: PV+battery when
+    # affordable, PV-only otherwise — see sizing block above).
     pv_rec = build_hourly_pv_output(panel, n_rec, irradiance)
-    disp_rec = run_dispatch_simulation(hourly_load, pv_rec, tariffs, battery)
-    econ_rec = compute_economics(disp_rec, panel, n_rec, battery, battery_units,
-                                 annual_kwh, avg_tariff, with_battery=battery is not None)
+    disp_rec = run_dispatch_simulation(hourly_load, pv_rec, tariffs, rec_battery)
+    econ_rec = compute_economics(disp_rec, panel, n_rec, rec_battery, rec_battery_units,
+                                 annual_kwh, avg_tariff, with_battery=rec_battery is not None)
     econ_rec["total_cells_on_roof"]      = n_rec * panel["cells"]
     econ_rec["total_cells_in_series"]    = n_rec * panel["cells_in_series"]
     econ_rec["total_cells_in_parallel"]  = n_rec * panel["cells_in_parallel"]
+    econ_rec["sizing_mode"]              = "pv_plus_battery" if rec_battery is not None else "pv_only"
     results["recommended_scenario"] = econ_rec
+
+    # Alternative recommended sizing: always provide a PV-only candidate so the
+    # agent can reason about the trade-off between more panels vs. a battery.
+    if rec_battery is None:
+        results["recommended_pv_only_scenario"] = None     # same as default
+    else:
+        pv_alt  = build_hourly_pv_output(panel, n_rec_pv_only, irradiance)
+        disp_alt = run_dispatch_simulation(hourly_load, pv_alt, tariffs, None)
+        econ_alt = compute_economics(disp_alt, panel, n_rec_pv_only, None, 0,
+                                     annual_kwh, avg_tariff, with_battery=False)
+        econ_alt["total_cells_on_roof"]      = n_rec_pv_only * panel["cells"]
+        econ_alt["total_cells_in_series"]    = n_rec_pv_only * panel["cells_in_series"]
+        econ_alt["total_cells_in_parallel"]  = n_rec_pv_only * panel["cells_in_parallel"]
+        econ_alt["sizing_mode"]              = "pv_only"
+        results["recommended_pv_only_scenario"] = econ_alt
 
     # 4F + 4H + 4I for optimal scenario (no battery to keep it simple)
     pv_opt = build_hourly_pv_output(panel, n_opt, irradiance)
